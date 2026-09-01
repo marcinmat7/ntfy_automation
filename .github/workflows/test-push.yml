@@ -1,0 +1,38 @@
+name: Test push
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "*/30 * * * *"
+
+jobs:
+  send-notification:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Send notification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.request
+
+          topic = os.environ["NTFY_TOPIC"]
+
+          req = urllib.request.Request(
+              f"https://ntfy.sh/{topic}",
+              data="Hello z GitHub Actions!".encode("utf-8"),
+              method="POST",
+          )
+
+          urllib.request.urlopen(req)
+
+          print("Powiadomienie wysłane")
+          PY
