@@ -80,6 +80,38 @@ jobs:
           }
 
 
+          WEATHER_ICONS = {
+              0: "☀️",
+              1: "🌤",
+              2: "⛅",
+              3: "☁️",
+              45: "🌫",
+              48: "🌫",
+              51: "🌦",
+              53: "🌦",
+              55: "🌧",
+              56: "🌧",
+              57: "🌧",
+              61: "🌦",
+              63: "🌧",
+              65: "🌧",
+              66: "🌧",
+              67: "🌧",
+              71: "🌨",
+              73: "❄️",
+              75: "❄️",
+              77: "❄️",
+              80: "🌦",
+              81: "🌧",
+              82: "🌧",
+              85: "🌨",
+              86: "🌨",
+              95: "⛈️",
+              96: "⛈️",
+              99: "⛈️",
+          }
+
+
           class TextCollector(HTMLParser):
               def __init__(self):
                   super().__init__(convert_charrefs=True)
@@ -155,14 +187,17 @@ jobs:
                   "language": "pl",
                   "format": "json",
               })
+
               geo = fetch_json(
                   f"https://geocoding-api.open-meteo.com/v1/search?{geo_params}"
               )
+
               results = geo.get("results") or []
               if not results:
                   raise RuntimeError(f"Nie znaleziono lokalizacji: {location}")
 
               place = results[0]
+
               forecast_params = urllib.parse.urlencode({
                   "latitude": place["latitude"],
                   "longitude": place["longitude"],
@@ -175,27 +210,44 @@ jobs:
                       "wind_speed_10m_max",
                   ]),
                   "timezone": "Europe/Warsaw",
-                  "forecast_days": 1,
+                  "forecast_days": 4,
               })
+
               data = fetch_json(
                   f"https://api.open-meteo.com/v1/forecast?{forecast_params}"
               )
+
               daily = data["daily"]
+              lines = [f"🌤 Pogoda — {place['name']}:"]
 
-              code = int(daily["weather_code"][0])
-              tmin = daily["temperature_2m_min"][0]
-              tmax = daily["temperature_2m_max"][0]
-              rain_prob = daily["precipitation_probability_max"][0]
-              rain_sum = daily["precipitation_sum"][0]
-              wind = daily["wind_speed_10m_max"][0]
-              description = WMO.get(code, f"kod pogody {code}")
+              for i in range(min(4, len(daily["time"]))):
+                  date = datetime.strptime(daily["time"][i], "%Y-%m-%d")
+                  code = int(daily["weather_code"][i])
 
-              return (
-                  f"🌤 Pogoda — {place['name']}: {description}\n"
-                  f"🌡 {tmin:.0f}–{tmax:.0f}°C | "
-                  f"🌧 {rain_prob:.0f}% ({rain_sum:.1f} mm) | "
-                  f"💨 do {wind:.0f} km/h"
-              )
+                  tmin = daily["temperature_2m_min"][i]
+                  tmax = daily["temperature_2m_max"][i]
+                  rain_prob = daily["precipitation_probability_max"][i]
+                  rain_sum = daily["precipitation_sum"][i]
+                  wind = daily["wind_speed_10m_max"][i]
+
+                  icon = WEATHER_ICONS.get(code, "🌤")
+
+                  if i == 0:
+                      date_label = "Dziś"
+                  elif i == 1:
+                      date_label = "Jutro"
+                  else:
+                      day = WEEKDAYS[date.weekday()]
+                      date_label = f"{day} {date:%d.%m}"
+
+                  lines.append(
+                      f"{date_label}: {icon} "
+                      f"{tmin:.0f}–{tmax:.0f}°C | "
+                      f"🌧 {rain_prob:.0f}% ({rain_sum:.1f} mm) | "
+                      f"💨 {wind:.0f} km/h"
+                  )
+
+              return "\n".join(lines)
 
 
           def unfold_ics(text):
@@ -411,14 +463,7 @@ jobs:
                       cleaned = candidate.strip(" •")
                       if not cleaned:
                           continue
-                      if (
-                          re.search(r"\d{4}", cleaned)
-                          or "league" in cleaned.lower()
-                          or "championship" in cleaned.lower()
-                          or "memorial" in cleaned.lower()
-                          or "cup" in cleaned.lower()
-                          or "friendly" in cleaned.lower()
-                      ):
+                      if re.search(r"\d{4}", cleaned) or "league" in cleaned.lower() or "championship" in cleaned.lower() or "memorial" in cleaned.lower() or "cup" in cleaned.lower() or "friendly" in cleaned.lower():
                           competition = cleaned
                           break
 
@@ -612,10 +657,7 @@ jobs:
                           if age.total_seconds() > NEWS_MAX_AGE_HOURS * 3600:
                               continue
                       except Exception as exc:
-                          print(
-                              f"Nie udało się sparsować daty newsa: "
-                              f"{published_text}: {exc}"
-                          )
+                          print(f"Nie udało się sparsować daty newsa: {published_text}: {exc}")
 
                   normalized = normalized_news_title(title)
                   if normalized in seen:
@@ -626,7 +668,6 @@ jobs:
                       "title": title,
                       "source": source,
                   })
-
                   if len(selected) >= NEWS_MAX_ITEMS:
                       break
 
@@ -672,14 +713,12 @@ jobs:
                   )
               else:
                   match_lines.append(
-                      "• 🇵🇱 Polska (siatkówka M): "
-                      "brak przyszłego meczu w źródłach"
+                      "• 🇵🇱 Polska (siatkówka M): brak przyszłego meczu w źródłach"
                   )
           except Exception as exc:
               print(f"Błąd terminarza siatkówki: {exc}")
               match_lines.append(
-                  "• 🇵🇱 Polska (siatkówka M): "
-                  "nie udało się pobrać terminarza"
+                  "• 🇵🇱 Polska (siatkówka M): nie udało się pobrać terminarza"
               )
 
           for label, slug in FOOTBALL_TEAMS:
@@ -705,14 +744,8 @@ jobs:
               if news:
                   news_lines = ["📰 Najważniejsze newsy:"]
                   for item in news:
-                      source_suffix = (
-                          f" — {item['source']}"
-                          if item.get("source")
-                          else ""
-                      )
-                      news_lines.append(
-                          f"• {item['title']}{source_suffix}"
-                      )
+                      source_suffix = f" — {item['source']}" if item.get("source") else ""
+                      news_lines.append(f"• {item['title']}{source_suffix}")
                   sections.append("\n".join(news_lines))
               else:
                   print("Brak świeżych newsów spełniających filtry")
@@ -722,10 +755,8 @@ jobs:
           sections.append("\n".join(match_lines))
 
           sections.append(
-              "Źródła danych: "
-              "Open-Meteo • Fixtur.es • Volleybox/ESPN • Google News"
+              "Źródła danych: Open-Meteo • Fixtur.es • Volleybox/ESPN • Google News"
           )
-
           message = "\n\n".join(sections)
 
           ntfy_req = urllib.request.Request(
