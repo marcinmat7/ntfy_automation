@@ -209,6 +209,10 @@ jobs:
                       "precipitation_sum",
                       "wind_speed_10m_max",
                   ]),
+                  "hourly": ",".join([
+                      "precipitation",
+                      "precipitation_probability",
+                  ]),
                   "timezone": "Europe/Warsaw",
                   "forecast_days": 4,
               })
@@ -217,6 +221,114 @@ jobs:
                   f"https://api.open-meteo.com/v1/forecast?{forecast_params}"
               )
 
+              # --- Deszcz na dziś: krótki komunikat na samą górę ---
+              hourly = data["hourly"]
+              today = datetime.now(TZ).date()
+              rainy_hours = []
+
+              for time_str, rain_mm, rain_prob in zip(
+                  hourly["time"],
+                  hourly["precipitation"],
+                  hourly["precipitation_probability"],
+              ):
+                  hour_dt = datetime.fromisoformat(time_str).replace(tzinfo=TZ)
+
+                  if hour_dt.date() != today:
+                      continue
+
+                  # Pomijamy godziny, które już minęły.
+                  if hour_dt < datetime.now(TZ).replace(
+                      minute=0,
+                      second=0,
+                      microsecond=0,
+                  ):
+                      continue
+
+                  rain_mm = float(rain_mm or 0)
+                  rain_prob = float(rain_prob or 0)
+
+                  # Za realny opad uznajemy co najmniej 0.1 mm/h.
+                  if rain_mm >= 0.1:
+                      rainy_hours.append((hour_dt, rain_prob))
+
+              if rainy_hours:
+                  ranges = []
+                  start_dt = rainy_hours[0][0]
+                  prev_dt = rainy_hours[0][0]
+                  probs = [rainy_hours[0][1]]
+
+                  for hour_dt, rain_prob in rainy_hours[1:]:
+                      if hour_dt - prev_dt == timedelta(hours=1):
+                          prev_dt = hour_dt
+                          probs.append(rain_prob)
+                      else:
+                          ranges.append(
+                              (
+                                  start_dt,
+                                  prev_dt + timedelta(hours=1),
+                                  max(probs),
+                              )
+                          )
+                          start_dt = hour_dt
+                          prev_dt = hour_dt
+                          probs = [rain_prob]
+
+                  ranges.append(
+                      (
+                          start_dt,
+                          prev_dt + timedelta(hours=1),
+                          max(probs),
+                      )
+                  )
+
+                  range_texts = []
+                  for start_dt, end_dt, max_prob in ranges:
+                      range_texts.append(
+                          f"{start_dt:%H:%M}–{end_dt:%H:%M}"
+                      )
+
+                  max_probability = max(prob for _, prob in rainy_hours)
+                  rain_alert = (
+                      f"☔ Deszcz dziś: {', '.join(range_texts)} "
+                      f"(max {max_probability:.0f}%)"
+                  )
+              else:
+                  # Jeśli model nie przewiduje mierzalnego opadu, ale prawdopodobieństwo
+                  # jest podwyższone, informujemy o możliwości deszczu.
+                  possible_hours = []
+                  for time_str, rain_prob in zip(
+                      hourly["time"],
+                      hourly["precipitation_probability"],
+                  ):
+                      hour_dt = datetime.fromisoformat(time_str).replace(tzinfo=TZ)
+
+                      if hour_dt.date() != today:
+                          continue
+
+                      if hour_dt < datetime.now(TZ).replace(
+                          minute=0,
+                          second=0,
+                          microsecond=0,
+                      ):
+                          continue
+
+                      rain_prob = float(rain_prob or 0)
+                      if rain_prob >= 50:
+                          possible_hours.append((hour_dt, rain_prob))
+
+                  if possible_hours:
+                      first_hour = possible_hours[0][0]
+                      last_hour = possible_hours[-1][0] + timedelta(hours=1)
+                      max_probability = max(prob for _, prob in possible_hours)
+                      rain_alert = (
+                          f"🌂 Możliwy deszcz dziś: "
+                          f"{first_hour:%H:%M}–{last_hour:%H:%M} "
+                          f"(max {max_probability:.0f}%)"
+                      )
+                  else:
+                      rain_alert = "☀️ Dziś bez deszczu w prognozie"
+
+              # --- Prognoza na dziś + 3 kolejne dni ---
               daily = data["daily"]
               lines = [f"🌤 Pogoda — {place['name']}:"]
 
@@ -247,7 +359,7 @@ jobs:
                       f"💨 {wind:.0f} km/h"
                   )
 
-              return "\n".join(lines)
+              return rain_alert, "\n".join(lines)
 
 
           def unfold_ics(text):
@@ -688,7 +800,9 @@ jobs:
           sections = []
 
           try:
-              sections.append(weather_report(location))
+              rain_alert, weather_text = weather_report(location)
+              sections.append(rain_alert)
+              sections.append(weather_text)
           except Exception as exc:
               print(f"Błąd pogody: {exc}")
               sections.append(
