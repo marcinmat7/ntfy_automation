@@ -34,9 +34,12 @@ jobs:
           from zoneinfo import ZoneInfo
 
           TZ = ZoneInfo("Europe/Warsaw")
-          USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+          USER_AGENT = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/140.0.0.0 Safari/537.36"
+          )
 
-          # SofaScore IDs. Endpoint zwraca mecze ze wszystkich rozgrywek drużyny.
           TEAMS = [
               ("🇵🇱 Polska (siatkówka M)", 6827),
               ("🔴 Widzew Łódź", 3115),
@@ -78,12 +81,15 @@ jobs:
 
           WEEKDAYS = ["pon.", "wt.", "śr.", "czw.", "pt.", "sob.", "niedz."]
 
-
           def fetch_json(url, retries=2):
               last_error = None
               headers = {
                   "User-Agent": USER_AGENT,
-                  "Accept": "application/json",
+                  "Accept": "application/json, text/plain, */*",
+                  "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
+                  "Referer": "https://www.sofascore.com/",
+                  "Origin": "https://www.sofascore.com",
+                  "X-Requested-With": "XMLHttpRequest",
               }
               for attempt in range(retries + 1):
                   try:
@@ -95,7 +101,6 @@ jobs:
                       if attempt < retries:
                           time.sleep(1.5 * (attempt + 1))
               raise last_error
-
 
           def weather_report(location):
               geo_params = urllib.parse.urlencode({
@@ -146,15 +151,15 @@ jobs:
                   f"💨 do {wind:.0f} km/h"
               )
 
-
           def next_match(team_id):
               now_ts = datetime.now(TZ).timestamp()
               endpoints = [
+                  f"https://api.sofascore.app/api/v1/team/{team_id}/events/next/0",
                   f"https://api.sofascore.com/api/v1/team/{team_id}/events/next/0",
                   f"https://www.sofascore.com/api/v1/team/{team_id}/events/next/0",
               ]
 
-              last_error = None
+              errors = []
               for url in endpoints:
                   try:
                       data = fetch_json(url, retries=1)
@@ -164,12 +169,13 @@ jobs:
                       ]
                       if not events:
                           return None
+                      print(f"Terminarz OK: {url}")
                       return min(events, key=lambda event: event["startTimestamp"])
                   except Exception as exc:
-                      last_error = exc
+                      errors.append(f"{url}: {exc}")
+                      print(f"Endpoint terminarza nie zadziałał: {url} -> {exc}")
 
-              raise last_error
-
+              raise RuntimeError(" | ".join(errors))
 
           def format_match(event):
               start = datetime.fromtimestamp(event["startTimestamp"], TZ)
@@ -182,7 +188,6 @@ jobs:
                   f"{home} – {away}"
                   + (f" ({competition})" if competition else "")
               )
-
 
           topic = os.environ["NTFY_TOPIC"].strip()
           location = os.environ.get("WEATHER_LOCATION", "Pabianice").strip()
@@ -210,7 +215,7 @@ jobs:
                   match_lines.append(f"• {label}: nie udało się pobrać terminarza")
 
           sections.append("\n".join(match_lines))
-          sections.append("Źródła danych: Open-Meteo • Sofascore")
+          sections.append("Źródła danych: Open-Meteo • SofaScore")
           message = "\n\n".join(sections)
 
           ntfy_req = urllib.request.Request(
