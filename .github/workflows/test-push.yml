@@ -22,29 +22,30 @@ jobs:
       - name: Pobierz pogodę i najbliższe mecze, a następnie wyślij ntfy
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
           WEATHER_LOCATION: "Pabianice"
         run: |
           python - <<'PY'
           import json
           import os
+          import re
           import time
-          import unicodedata
           import urllib.error
           import urllib.parse
           import urllib.request
-          from datetime import datetime
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timedelta, timezone
+          from email.utils import parsedate_to_datetime
+          from html.parser import HTMLParser
           from zoneinfo import ZoneInfo
 
           TZ = ZoneInfo("Europe/Warsaw")
-          FOOTBALL_BASE = "https://v3.football.api-sports.io"
-          VOLLEYBALL_BASE = "https://v1.volleyball.api-sports.io"
+          WEEKDAYS = ["pon.", "wt.", "śr.", "czw.", "pt.", "sob.", "niedz."]
 
           FOOTBALL_TEAMS = [
-              ("🔴 Widzew Łódź", "Widzew", "Poland", ["Widzew Łódź", "Widzew Lodz"]),
-              ("⚪ Real Madryt", "Real Madrid", "Spain", ["Real Madrid"]),
-              ("🔵🔴 FC Barcelona", "Barcelona", "Spain", ["Barcelona", "FC Barcelona"]),
-              ("🔴⚫ AC Milan", "AC Milan", "Italy", ["AC Milan", "Milan"]),
+              ("🔴 Widzew Łódź", "widzew-lodz"),
+              ("⚪ Real Madryt", "real-madrid"),
+              ("🔵🔴 FC Barcelona", "fc-barcelona"),
+              ("🔴⚫ AC Milan", "ac-milan"),
           ]
 
           WMO = {
@@ -78,17 +79,38 @@ jobs:
               99: "burze z silnym gradem",
           }
 
-          WEEKDAYS = ["pon.", "wt.", "śr.", "czw.", "pt.", "sob.", "niedz."]
 
-          def normalize(text):
-              text = unicodedata.normalize("NFKD", str(text))
-              text = "".join(ch for ch in text if not unicodedata.combining(ch))
-              return " ".join(text.lower().split())
+          class TextCollector(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.tokens = []
+                  self.ignored_depth = 0
 
-          def fetch_json(url, headers=None, retries=2):
+              def handle_starttag(self, tag, attrs):
+                  if tag in {"script", "style", "noscript", "svg"}:
+                      self.ignored_depth += 1
+
+              def handle_endtag(self, tag):
+                  if tag in {"script", "style", "noscript", "svg"} and self.ignored_depth:
+                      self.ignored_depth -= 1
+
+              def handle_data(self, data):
+                  if self.ignored_depth:
+                      return
+                  text = " ".join(data.split())
+                  if text:
+                      self.tokens.append(text)
+
+
+          def fetch_bytes(url, headers=None, retries=2):
               request_headers = {
-                  "User-Agent": "ntfy-morning-report/1.0",
-                  "Accept": "application/json",
+                  "User-Agent": (
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/140.0 Safari/537.36"
+                  ),
+                  "Accept": "*/*",
+                  "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
               }
               if headers:
                   request_headers.update(headers)
@@ -98,14 +120,15 @@ jobs:
                   try:
                       req = urllib.request.Request(url, headers=request_headers)
                       with urllib.request.urlopen(req, timeout=25) as response:
-                          return json.load(response)
+                          return response.read()
                   except urllib.error.HTTPError as exc:
                       try:
-                          body = exc.read().decode("utf-8", errors="replace")[:700]
+                          body = exc.read().decode("utf-8", errors="replace")[:400]
                       except Exception:
                           body = ""
                       last_error = RuntimeError(
-                          f"HTTP {exc.code} {exc.reason}" + (f" | {body}" if body else "")
+                          f"HTTP {exc.code} {exc.reason}"
+                          + (f" | {body}" if body else "")
                       )
                   except Exception as exc:
                       last_error = exc
@@ -115,18 +138,15 @@ jobs:
 
               raise last_error
 
-          def api_get(base, endpoint, params, api_key):
-              query = urllib.parse.urlencode(params)
-              url = f"{base}/{endpoint}?{query}"
-              data = fetch_json(
-                  url,
-                  headers={"x-apisports-key": api_key},
-                  retries=1,
-              )
-              errors = data.get("errors")
-              if errors:
-                  raise RuntimeError(f"API-Sports {endpoint}: {errors}")
-              return data
+
+          def fetch_text(url, headers=None, retries=2):
+              raw = fetch_bytes(url, headers=headers, retries=retries)
+              return raw.decode("utf-8", errors="replace")
+
+
+          def fetch_json(url, headers=None, retries=2):
+              return json.loads(fetch_text(url, headers=headers, retries=retries))
+
 
           def weather_report(location):
               geo_params = urllib.parse.urlencode({
@@ -177,185 +197,452 @@ jobs:
                   f"💨 do {wind:.0f} km/h"
               )
 
-          def resolve_football_team(search, country, preferred_names, api_key):
-              data = api_get(
-                  FOOTBALL_BASE,
-                  "teams",
-                  {"search": search},
-                  api_key,
-              )
-              candidates = data.get("response") or []
-              if not candidates:
-                  raise RuntimeError(f"Brak wyników wyszukiwania drużyny: {search}")
 
-              preferred = {normalize(name) for name in preferred_names}
-              search_n = normalize(search)
-              best = None
-              best_score = -1
+          def unfold_ics(text):
+              lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+              unfolded = []
+              for line in lines:
+                  if line.startswith((" ", "\t")) and unfolded:
+                      unfolded[-1] += line[1:]
+                  else:
+                      unfolded.append(line)
+              return unfolded
 
-              for item in candidates:
-                  team = item.get("team", {})
-                  name = team.get("name", "")
-                  team_country = team.get("country", "")
-                  score = 0
-                  if normalize(team_country) == normalize(country):
-                      score += 30
-                  if normalize(name) in preferred:
-                      score += 100
-                  elif search_n in normalize(name):
-                      score += 20
 
-                  if score > best_score:
-                      best = team
-                      best_score = score
-
-              if not best or best_score < 30:
-                  found = [
-                      f"{item.get('team', {}).get('name')} ({item.get('team', {}).get('country')})"
-                      for item in candidates[:8]
-                  ]
-                  raise RuntimeError(
-                      f"Nie udało się jednoznacznie dopasować {search}; wyniki: {found}"
-                  )
-
-              print(f"Football team: {search} -> {best['name']} (ID {best['id']})")
-              return best["id"]
-
-          def next_football_match(team_id, api_key):
-              data = api_get(
-                  FOOTBALL_BASE,
-                  "fixtures",
-                  {
-                      "team": team_id,
-                      "next": 1,
-                      "timezone": "Europe/Warsaw",
-                  },
-                  api_key,
-              )
-              fixtures = data.get("response") or []
-              return fixtures[0] if fixtures else None
-
-          def format_football_match(item):
-              fixture = item.get("fixture", {})
-              start = datetime.fromisoformat(fixture["date"]).astimezone(TZ)
-              teams = item.get("teams", {})
-              home = teams.get("home", {}).get("name", "?")
-              away = teams.get("away", {}).get("name", "?")
-              competition = item.get("league", {}).get("name", "")
-              day = WEEKDAYS[start.weekday()]
+          def unescape_ics(value):
               return (
-                  f"{day} {start:%d.%m}, {start:%H:%M} — {home} – {away}"
-                  + (f" ({competition})" if competition else "")
+                  value.replace("\\n", " ")
+                  .replace("\\N", " ")
+                  .replace("\\,", ",")
+                  .replace("\\;", ";")
+                  .replace("\\\\", "\\")
+                  .strip()
               )
 
-          def resolve_poland_volleyball(api_key):
-              attempts = [
-                  {"search": "Poland"},
-                  {"name": "Poland"},
+
+          def parse_ics_datetime(key, value):
+              params = {}
+              for part in key.split(";")[1:]:
+                  if "=" in part:
+                      k, v = part.split("=", 1)
+                      params[k.upper()] = v
+
+              value = value.strip()
+              if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", value):
+                  dt = datetime.strptime(value[:8], "%Y%m%d")
+                  return dt.replace(tzinfo=TZ)
+
+              if value.endswith("Z"):
+                  dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+                  return dt.replace(tzinfo=timezone.utc).astimezone(TZ)
+
+              fmt = "%Y%m%dT%H%M%S" if len(value) >= 15 else "%Y%m%dT%H%M"
+              dt = datetime.strptime(value, fmt)
+              tzid = params.get("TZID")
+              if tzid:
+                  try:
+                      return dt.replace(tzinfo=ZoneInfo(tzid)).astimezone(TZ)
+                  except Exception:
+                      pass
+              return dt.replace(tzinfo=TZ)
+
+
+          def parse_ics_events(text):
+              events = []
+              current = None
+
+              for line in unfold_ics(text):
+                  if line == "BEGIN:VEVENT":
+                      current = {}
+                      continue
+                  if line == "END:VEVENT":
+                      if current:
+                          events.append(current)
+                      current = None
+                      continue
+                  if current is None or ":" not in line:
+                      continue
+
+                  key, value = line.split(":", 1)
+                  base_key = key.split(";", 1)[0].upper()
+
+                  if base_key == "DTSTART":
+                      try:
+                          current["start"] = parse_ics_datetime(key, value)
+                      except Exception as exc:
+                          print(f"Nie udało się sparsować DTSTART {value}: {exc}")
+                  elif base_key == "SUMMARY":
+                      current["summary"] = unescape_ics(value)
+                  elif base_key == "STATUS":
+                      current["status"] = value.strip().upper()
+                  elif base_key == "DESCRIPTION":
+                      current["description"] = unescape_ics(value)
+
+              return events
+
+
+          def football_from_ics(slug):
+              url = f"https://ics.fixtur.es/v2/{slug}.ics"
+              text = fetch_text(url, retries=1)
+              events = parse_ics_events(text)
+              now = datetime.now(TZ)
+
+              future = [
+                  event for event in events
+                  if event.get("start")
+                  and event["start"] > now
+                  and event.get("status") != "CANCELLED"
+                  and event.get("summary")
               ]
+              if not future:
+                  return None
+
+              event = min(future, key=lambda x: x["start"])
+              print(f"Fixtur.es ICS OK dla {slug}: {event['summary']}")
+              return event["start"], event["summary"]
+
+
+          FOOTBALL_DATE_RE = re.compile(
+              r"^\d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2} [+-]\d{2}:\d{2}$"
+          )
+
+
+          def football_from_html(slug):
+              url = f"https://fixtur.es/en/team/{slug}?noTimeZoneConvert=1"
+              html = fetch_text(url, retries=1)
+              parser = TextCollector()
+              parser.feed(html)
+              now = datetime.now(TZ)
+              matches = []
+
+              for i, token in enumerate(parser.tokens):
+                  if not FOOTBALL_DATE_RE.fullmatch(token):
+                      continue
+                  try:
+                      start = datetime.strptime(token, "%d %b %Y %H:%M %z").astimezone(TZ)
+                  except Exception:
+                      continue
+                  if start <= now:
+                      continue
+
+                  game = None
+                  for candidate in parser.tokens[i + 1:i + 8]:
+                      if " - " in candidate and not re.fullmatch(r"\d+\s*[-–:]\s*\d+", candidate):
+                          game = candidate.strip()
+                          break
+
+                  if game:
+                      matches.append((start, game))
+
+              if not matches:
+                  return None
+
+              match = min(matches, key=lambda x: x[0])
+              print(f"Fixtur.es HTML fallback OK dla {slug}: {match[1]}")
+              return match
+
+
+          def next_football_match(slug):
               errors = []
 
-              for params in attempts:
-                  try:
-                      data = api_get(VOLLEYBALL_BASE, "teams", params, api_key)
-                      candidates = data.get("response") or []
-                      if not candidates:
-                          continue
+              try:
+                  match = football_from_ics(slug)
+                  if match:
+                      return match
+              except Exception as exc:
+                  errors.append(f"ICS: {exc}")
+                  print(f"Fixtur.es ICS błąd dla {slug}: {exc}")
 
-                      best = None
-                      best_score = -1
-                      for item in candidates:
-                          team = item.get("team", item)
-                          name = team.get("name", "")
-                          country = team.get("country") or {}
-                          if isinstance(country, dict):
-                              country_name = country.get("name", "")
-                          else:
-                              country_name = str(country)
-
-                          score = 0
-                          if normalize(name) == "poland":
-                              score += 100
-                          elif "poland" in normalize(name):
-                              score += 20
-                          if normalize(country_name) == "poland":
-                              score += 30
-                          if team.get("national") is True:
-                              score += 20
-
-                          if score > best_score:
-                              best = team
-                              best_score = score
-
-                      if best and normalize(best.get("name", "")) == "poland":
-                          print(
-                              f"Volleyball team: Poland -> {best['name']} "
-                              f"(ID {best['id']})"
-                          )
-                          return best["id"]
-                  except Exception as exc:
-                      errors.append(str(exc))
-
-              raise RuntimeError(
-                  "Nie znaleziono reprezentacji Polski w API-Volleyball"
-                  + (f" | {' | '.join(errors)}" if errors else "")
-              )
-
-          def next_volleyball_match(team_id, api_key):
-              now_ts = int(datetime.now(TZ).timestamp())
-              year = datetime.now(TZ).year
-              future_games = []
-              errors = []
-
-              for season in (year, year + 1):
-                  try:
-                      data = api_get(
-                          VOLLEYBALL_BASE,
-                          "games",
-                          {
-                              "team": team_id,
-                              "season": season,
-                              "timezone": "Europe/Warsaw",
-                          },
-                          api_key,
-                      )
-                      for game in data.get("response") or []:
-                          ts = int(game.get("timestamp") or 0)
-                          if ts >= now_ts:
-                              future_games.append(game)
-                  except Exception as exc:
-                      errors.append(f"sezon {season}: {exc}")
-
-              if future_games:
-                  return min(future_games, key=lambda game: int(game.get("timestamp") or 0))
+              try:
+                  match = football_from_html(slug)
+                  if match:
+                      return match
+              except Exception as exc:
+                  errors.append(f"HTML: {exc}")
+                  print(f"Fixtur.es HTML błąd dla {slug}: {exc}")
 
               if errors:
                   raise RuntimeError(" | ".join(errors))
               return None
 
-          def format_volleyball_match(game):
-              if game.get("timestamp"):
-                  start = datetime.fromtimestamp(int(game["timestamp"]), TZ)
-              else:
-                  start = datetime.fromisoformat(game["date"]).astimezone(TZ)
-              teams = game.get("teams", {})
-              home = teams.get("home", {}).get("name", "?")
-              away = teams.get("away", {}).get("name", "?")
-              competition = game.get("league", {}).get("name", "")
-              day = WEEKDAYS[start.weekday()]
-              return (
-                  f"{day} {start:%d.%m}, {start:%H:%M} — {home} – {away}"
-                  + (f" ({competition})" if competition else "")
+
+          SCORE_RE = re.compile(r"^\d+\s*:\s*\d+$")
+          TIMESTAMP_RE = re.compile(r"(?<!\d)(\d{10})(?!\d)")
+
+
+          def next_poland_volleyball_from_volleybox():
+              url = "https://volleybox.net/poland-t472/matches"
+              html = fetch_text(url, retries=1)
+              parser = TextCollector()
+              parser.feed(html)
+              tokens = parser.tokens
+
+              now_ts = int(datetime.now(TZ).timestamp())
+              matches = []
+
+              for i, token in enumerate(tokens):
+                  timestamp_match = TIMESTAMP_RE.search(token)
+                  if not timestamp_match:
+                      continue
+
+                  ts = int(timestamp_match.group(1))
+                  if ts <= now_ts:
+                      continue
+
+                  score_index = None
+                  for j in range(i + 1, min(i + 22, len(tokens))):
+                      if SCORE_RE.fullmatch(tokens[j]):
+                          score_index = j
+                          break
+
+                  if score_index is None or score_index <= i + 1:
+                      continue
+                  if score_index + 1 >= len(tokens):
+                      continue
+
+                  team1 = tokens[score_index - 1].strip()
+                  team2 = tokens[score_index + 1].strip()
+
+                  if "poland" not in team1.lower() and "poland" not in team2.lower():
+                      continue
+
+                  competition = ""
+                  for candidate in tokens[i + 1:score_index - 1]:
+                      cleaned = candidate.strip(" •")
+                      if not cleaned:
+                          continue
+                      if (
+                          re.search(r"\d{4}", cleaned)
+                          or "league" in cleaned.lower()
+                          or "championship" in cleaned.lower()
+                          or "memorial" in cleaned.lower()
+                          or "cup" in cleaned.lower()
+                          or "friendly" in cleaned.lower()
+                      ):
+                          competition = cleaned
+                          break
+
+                  matches.append({
+                      "timestamp": ts,
+                      "home": team1,
+                      "away": team2,
+                      "competition": competition,
+                  })
+
+              if not matches:
+                  return None
+
+              match = min(matches, key=lambda x: x["timestamp"])
+              print(
+                  "Volleybox OK: "
+                  f"{match['home']} - {match['away']} @ {match['timestamp']}"
               )
+              return match
+
+
+          def next_poland_volleyball_from_espn():
+              now = datetime.now(TZ)
+              date_from = now.strftime("%Y%m%d")
+              date_to = (now + timedelta(days=240)).strftime("%Y%m%d")
+              url = (
+                  "https://site.api.espn.com/apis/site/v2/sports/"
+                  f"volleyball/fivb.m/scoreboard?dates={date_from}-{date_to}&limit=200"
+              )
+              data = fetch_json(url, retries=1)
+              matches = []
+
+              for event in data.get("events") or []:
+                  try:
+                      start = datetime.fromisoformat(
+                          event["date"].replace("Z", "+00:00")
+                      ).astimezone(TZ)
+                  except Exception:
+                      continue
+                  if start <= now:
+                      continue
+
+                  competition = (event.get("competitions") or [{}])[0]
+                  competitors = competition.get("competitors") or []
+
+                  poland_present = False
+                  home = None
+                  away = None
+
+                  for competitor in competitors:
+                      team = competitor.get("team") or {}
+                      name = (
+                          team.get("displayName")
+                          or team.get("shortDisplayName")
+                          or team.get("name")
+                          or ""
+                      )
+                      if "poland" in name.lower():
+                          poland_present = True
+                      if competitor.get("homeAway") == "home":
+                          home = name
+                      elif competitor.get("homeAway") == "away":
+                          away = name
+
+                  if not poland_present:
+                      continue
+
+                  if not home or not away:
+                      names = [
+                          (c.get("team") or {}).get("displayName", "?")
+                          for c in competitors
+                      ]
+                      if len(names) >= 2:
+                          home, away = names[0], names[1]
+
+                  matches.append({
+                      "timestamp": int(start.timestamp()),
+                      "home": home or "?",
+                      "away": away or "?",
+                      "competition": "FIVB",
+                  })
+
+              if not matches:
+                  return None
+
+              match = min(matches, key=lambda x: x["timestamp"])
+              print(f"ESPN volleyball fallback OK: {match['home']} - {match['away']}")
+              return match
+
+
+          def next_poland_volleyball():
+              errors = []
+
+              try:
+                  match = next_poland_volleyball_from_volleybox()
+                  if match:
+                      return match
+              except Exception as exc:
+                  errors.append(f"Volleybox: {exc}")
+                  print(f"Volleybox błąd: {exc}")
+
+              try:
+                  match = next_poland_volleyball_from_espn()
+                  if match:
+                      return match
+              except Exception as exc:
+                  errors.append(f"ESPN: {exc}")
+                  print(f"ESPN volleyball błąd: {exc}")
+
+              if errors:
+                  raise RuntimeError(" | ".join(errors))
+              return None
+
+
+          NEWS_RSS_URL = "https://news.google.com/rss?hl=pl&gl=PL&ceid=PL:pl"
+          NEWS_MAX_ITEMS = 5
+          NEWS_MAX_AGE_HOURS = 30
+
+          NEWS_SKIP_WORDS = {
+              "horoskop",
+              "znaki zodiaku",
+              "lotto",
+              "loteria",
+              "euromillions",
+              "pudelek",
+              "pomponik",
+              "celebryt",
+              "serial",
+              "program tv",
+              "quiz",
+              "transfer",
+              "wynik meczu",
+              "liga mistrzów",
+              "ekstraklasa",
+          }
+
+          NEWS_SKIP_SOURCES = {
+              "Pudelek",
+              "Pomponik",
+              "Plotek.pl",
+              "Viva.pl",
+          }
+
+
+          def clean_news_title(title, source):
+              title = re.sub(r"<[^>]+>", "", title or "")
+              title = " ".join(title.split()).strip()
+              suffix = f" - {source}" if source else ""
+              if suffix and title.endswith(suffix):
+                  title = title[:-len(suffix)].strip()
+              return title
+
+
+          def normalized_news_title(title):
+              text = title.lower()
+              text = re.sub(r"[^a-ząćęłńóśźż0-9 ]+", " ", text)
+              return " ".join(text.split())
+
+
+          def is_soft_news(title, source):
+              if source in NEWS_SKIP_SOURCES:
+                  return True
+              haystack = f"{title} {source}".lower()
+              return any(word in haystack for word in NEWS_SKIP_WORDS)
+
+
+          def important_news():
+              raw = fetch_bytes(NEWS_RSS_URL, retries=1)
+              root = ET.fromstring(raw)
+              now_utc = datetime.now(timezone.utc)
+              selected = []
+              seen = set()
+
+              for item in root.findall(".//item"):
+                  source_node = item.find("source")
+                  source = ""
+                  if source_node is not None and source_node.text:
+                      source = " ".join(source_node.text.split()).strip()
+
+                  title = clean_news_title(item.findtext("title") or "", source)
+                  if not title or is_soft_news(title, source):
+                      continue
+
+                  published_text = item.findtext("pubDate") or ""
+                  if published_text:
+                      try:
+                          published = parsedate_to_datetime(published_text)
+                          if published.tzinfo is None:
+                              published = published.replace(tzinfo=timezone.utc)
+                          age = now_utc - published.astimezone(timezone.utc)
+                          if age.total_seconds() > NEWS_MAX_AGE_HOURS * 3600:
+                              continue
+                      except Exception as exc:
+                          print(
+                              f"Nie udało się sparsować daty newsa: "
+                              f"{published_text}: {exc}"
+                          )
+
+                  normalized = normalized_news_title(title)
+                  if normalized in seen:
+                      continue
+                  seen.add(normalized)
+
+                  selected.append({
+                      "title": title,
+                      "source": source,
+                  })
+
+                  if len(selected) >= NEWS_MAX_ITEMS:
+                      break
+
+              return selected
+
+
+          def format_datetime(start):
+              day = WEEKDAYS[start.weekday()]
+              return f"{day} {start:%d.%m}, {start:%H:%M}"
+
 
           topic = os.environ.get("NTFY_TOPIC", "").strip()
-          api_key = os.environ.get("APISPORTS_KEY", "").strip()
           location = os.environ.get("WEATHER_LOCATION", "Pabianice").strip()
 
           if not topic:
               raise RuntimeError("Secret NTFY_TOPIC jest pusty")
-          if not api_key:
-              raise RuntimeError("Secret APISPORTS_KEY jest pusty lub nie istnieje")
 
           sections = []
 
@@ -363,45 +650,82 @@ jobs:
               sections.append(weather_report(location))
           except Exception as exc:
               print(f"Błąd pogody: {exc}")
-              sections.append(f"🌤 Pogoda — {location}: nie udało się pobrać danych")
+              sections.append(
+                  f"🌤 Pogoda — {location}: nie udało się pobrać danych"
+              )
 
           match_lines = ["🏟 Najbliższe mecze:"]
 
           try:
-              poland_id = resolve_poland_volleyball(api_key)
-              game = next_volleyball_match(poland_id, api_key)
-              if game:
+              match = next_poland_volleyball()
+              if match:
+                  start = datetime.fromtimestamp(match["timestamp"], TZ)
+                  competition = (
+                      f" ({match['competition']})"
+                      if match.get("competition")
+                      else ""
+                  )
                   match_lines.append(
-                      f"• 🇵🇱 Polska (siatkówka M): {format_volleyball_match(game)}"
+                      "• 🇵🇱 Polska (siatkówka M): "
+                      f"{format_datetime(start)} — "
+                      f"{match['home']} – {match['away']}{competition}"
                   )
               else:
                   match_lines.append(
-                      "• 🇵🇱 Polska (siatkówka M): brak zaplanowanego meczu w API"
+                      "• 🇵🇱 Polska (siatkówka M): "
+                      "brak przyszłego meczu w źródłach"
                   )
           except Exception as exc:
               print(f"Błąd terminarza siatkówki: {exc}")
               match_lines.append(
-                  "• 🇵🇱 Polska (siatkówka M): nie udało się pobrać terminarza"
+                  "• 🇵🇱 Polska (siatkówka M): "
+                  "nie udało się pobrać terminarza"
               )
 
-          for label, search, country, preferred_names in FOOTBALL_TEAMS:
+          for label, slug in FOOTBALL_TEAMS:
               try:
-                  team_id = resolve_football_team(
-                      search, country, preferred_names, api_key
-                  )
-                  fixture = next_football_match(team_id, api_key)
-                  if fixture:
+                  match = next_football_match(slug)
+                  if match:
+                      start, game = match
                       match_lines.append(
-                          f"• {label}: {format_football_match(fixture)}"
+                          f"• {label}: {format_datetime(start)} — {game}"
                       )
                   else:
-                      match_lines.append(f"• {label}: brak zaplanowanego meczu w API")
+                      match_lines.append(
+                          f"• {label}: brak przyszłego meczu w Fixtur.es"
+                      )
               except Exception as exc:
                   print(f"Błąd terminarza dla {label}: {exc}")
-                  match_lines.append(f"• {label}: nie udało się pobrać terminarza")
+                  match_lines.append(
+                      f"• {label}: nie udało się pobrać terminarza"
+                  )
+
+          try:
+              news = important_news()
+              if news:
+                  news_lines = ["📰 Najważniejsze newsy:"]
+                  for item in news:
+                      source_suffix = (
+                          f" — {item['source']}"
+                          if item.get("source")
+                          else ""
+                      )
+                      news_lines.append(
+                          f"• {item['title']}{source_suffix}"
+                      )
+                  sections.append("\n".join(news_lines))
+              else:
+                  print("Brak świeżych newsów spełniających filtry")
+          except Exception as exc:
+              print(f"Błąd pobierania newsów: {exc}")
 
           sections.append("\n".join(match_lines))
-          sections.append("Źródła danych: Open-Meteo • API-Sports")
+
+          sections.append(
+              "Źródła danych: "
+              "Open-Meteo • Fixtur.es • Volleybox/ESPN • Google News"
+          )
+
           message = "\n\n".join(sections)
 
           ntfy_req = urllib.request.Request(
@@ -417,5 +741,6 @@ jobs:
 
           with urllib.request.urlopen(ntfy_req, timeout=20) as response:
               print(f"Powiadomienie wysłane, HTTP {response.status}")
+
           print(message)
           PY
