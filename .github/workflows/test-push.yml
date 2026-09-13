@@ -210,6 +210,7 @@ jobs:
                       "wind_speed_10m_max",
                   ]),
                   "hourly": ",".join([
+                      "temperature_2m",
                       "precipitation",
                       "precipitation_probability",
                   ]),
@@ -328,6 +329,42 @@ jobs:
                   else:
                       rain_alert = "☀️ Dziś bez deszczu w prognozie"
 
+              # --- Temperatura godzinowa na najbliższe 24h ---
+              now_hour = datetime.now(TZ).replace(
+                  minute=0,
+                  second=0,
+                  microsecond=0,
+              )
+
+              hourly_points = []
+              for time_str, temp in zip(
+                  hourly["time"],
+                  hourly["temperature_2m"],
+              ):
+                  hour_dt = datetime.fromisoformat(time_str).replace(tzinfo=TZ)
+
+                  if hour_dt < now_hour:
+                      continue
+                  if hour_dt >= now_hour + timedelta(hours=24):
+                      continue
+
+                  hourly_points.append(
+                      (hour_dt, float(temp))
+                  )
+
+              temp_lines = ["🌡 Temperatura — najbliższe 24h:"]
+
+              for i in range(0, len(hourly_points), 4):
+                  chunk = hourly_points[i:i + 4]
+                  temp_lines.append(
+                      " | ".join(
+                          f"{hour_dt:%H:%M} {temp:.0f}°"
+                          for hour_dt, temp in chunk
+                      )
+                  )
+
+              temperature_24h = "\n".join(temp_lines)
+
               # --- Prognoza na dziś + 3 kolejne dni ---
               daily = data["daily"]
               lines = [f"🌤 Pogoda — {place['name']}:"]
@@ -359,7 +396,7 @@ jobs:
                       f"💨 {wind:.0f} km/h"
                   )
 
-              return rain_alert, "\n".join(lines)
+              return rain_alert, "\n".join(lines), temperature_24h
 
 
           def unfold_ics(text):
@@ -800,9 +837,10 @@ jobs:
           sections = []
 
           try:
-              rain_alert, weather_text = weather_report(location)
+              rain_alert, weather_text, temperature_24h = weather_report(location)
               sections.append(rain_alert)
               sections.append(weather_text)
+              sections.append(temperature_24h)
           except Exception as exc:
               print(f"Błąd pogody: {exc}")
               sections.append(
