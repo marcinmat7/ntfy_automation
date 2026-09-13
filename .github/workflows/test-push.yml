@@ -354,13 +354,9 @@ jobs:
 
               temp_lines = ["🌡 Temperatura — najbliższe 24h:"]
 
-              for i in range(0, len(hourly_points), 4):
-                  chunk = hourly_points[i:i + 4]
+              for hour_dt, temp in hourly_points:
                   temp_lines.append(
-                      " | ".join(
-                          f"{hour_dt:%H:%M} {temp:.0f}°"
-                          for hour_dt, temp in chunk
-                      )
+                      f"{hour_dt:%H:%M} — {temp:.0f}°C"
                   )
 
               temperature_24h = "\n".join(temp_lines)
