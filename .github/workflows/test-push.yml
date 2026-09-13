@@ -22,30 +22,29 @@ jobs:
       - name: Pobierz pogodę i najbliższe mecze, a następnie wyślij ntfy
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          APISPORTS_KEY: ${{ secrets.APISPORTS_KEY }}
           WEATHER_LOCATION: "Pabianice"
         run: |
           python - <<'PY'
           import json
           import os
           import time
+          import unicodedata
+          import urllib.error
           import urllib.parse
           import urllib.request
           from datetime import datetime
           from zoneinfo import ZoneInfo
 
           TZ = ZoneInfo("Europe/Warsaw")
-          USER_AGENT = (
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/140.0.0.0 Safari/537.36"
-          )
+          FOOTBALL_BASE = "https://v3.football.api-sports.io"
+          VOLLEYBALL_BASE = "https://v1.volleyball.api-sports.io"
 
-          TEAMS = [
-              ("🇵🇱 Polska (siatkówka M)", 6827),
-              ("🔴 Widzew Łódź", 3115),
-              ("⚪ Real Madryt", 2829),
-              ("🔵🔴 FC Barcelona", 2817),
-              ("🔴⚫ AC Milan", 2692),
+          FOOTBALL_TEAMS = [
+              ("🔴 Widzew Łódź", "Widzew", "Poland", ["Widzew Łódź", "Widzew Lodz"]),
+              ("⚪ Real Madryt", "Real Madrid", "Spain", ["Real Madrid"]),
+              ("🔵🔴 FC Barcelona", "Barcelona", "Spain", ["Barcelona", "FC Barcelona"]),
+              ("🔴⚫ AC Milan", "AC Milan", "Italy", ["AC Milan", "Milan"]),
           ]
 
           WMO = {
@@ -81,26 +80,53 @@ jobs:
 
           WEEKDAYS = ["pon.", "wt.", "śr.", "czw.", "pt.", "sob.", "niedz."]
 
-          def fetch_json(url, retries=2):
-              last_error = None
-              headers = {
-                  "User-Agent": USER_AGENT,
-                  "Accept": "application/json, text/plain, */*",
-                  "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
-                  "Referer": "https://www.sofascore.com/",
-                  "Origin": "https://www.sofascore.com",
-                  "X-Requested-With": "XMLHttpRequest",
+          def normalize(text):
+              text = unicodedata.normalize("NFKD", str(text))
+              text = "".join(ch for ch in text if not unicodedata.combining(ch))
+              return " ".join(text.lower().split())
+
+          def fetch_json(url, headers=None, retries=2):
+              request_headers = {
+                  "User-Agent": "ntfy-morning-report/1.0",
+                  "Accept": "application/json",
               }
+              if headers:
+                  request_headers.update(headers)
+
+              last_error = None
               for attempt in range(retries + 1):
                   try:
-                      req = urllib.request.Request(url, headers=headers)
-                      with urllib.request.urlopen(req, timeout=20) as response:
+                      req = urllib.request.Request(url, headers=request_headers)
+                      with urllib.request.urlopen(req, timeout=25) as response:
                           return json.load(response)
+                  except urllib.error.HTTPError as exc:
+                      try:
+                          body = exc.read().decode("utf-8", errors="replace")[:700]
+                      except Exception:
+                          body = ""
+                      last_error = RuntimeError(
+                          f"HTTP {exc.code} {exc.reason}" + (f" | {body}" if body else "")
+                      )
                   except Exception as exc:
                       last_error = exc
-                      if attempt < retries:
-                          time.sleep(1.5 * (attempt + 1))
+
+                  if attempt < retries:
+                      time.sleep(1.5 * (attempt + 1))
+
               raise last_error
+
+          def api_get(base, endpoint, params, api_key):
+              query = urllib.parse.urlencode(params)
+              url = f"{base}/{endpoint}?{query}"
+              data = fetch_json(
+                  url,
+                  headers={"x-apisports-key": api_key},
+                  retries=1,
+              )
+              errors = data.get("errors")
+              if errors:
+                  raise RuntimeError(f"API-Sports {endpoint}: {errors}")
+              return data
 
           def weather_report(location):
               geo_params = urllib.parse.urlencode({
@@ -151,48 +177,185 @@ jobs:
                   f"💨 do {wind:.0f} km/h"
               )
 
-          def next_match(team_id):
-              now_ts = datetime.now(TZ).timestamp()
-              endpoints = [
-                  f"https://api.sofascore.app/api/v1/team/{team_id}/events/next/0",
-                  f"https://api.sofascore.com/api/v1/team/{team_id}/events/next/0",
-                  f"https://www.sofascore.com/api/v1/team/{team_id}/events/next/0",
-              ]
+          def resolve_football_team(search, country, preferred_names, api_key):
+              data = api_get(
+                  FOOTBALL_BASE,
+                  "teams",
+                  {"search": search},
+                  api_key,
+              )
+              candidates = data.get("response") or []
+              if not candidates:
+                  raise RuntimeError(f"Brak wyników wyszukiwania drużyny: {search}")
 
-              errors = []
-              for url in endpoints:
-                  try:
-                      data = fetch_json(url, retries=1)
-                      events = [
-                          event for event in data.get("events", [])
-                          if event.get("startTimestamp", 0) >= now_ts
-                      ]
-                      if not events:
-                          return None
-                      print(f"Terminarz OK: {url}")
-                      return min(events, key=lambda event: event["startTimestamp"])
-                  except Exception as exc:
-                      errors.append(f"{url}: {exc}")
-                      print(f"Endpoint terminarza nie zadziałał: {url} -> {exc}")
+              preferred = {normalize(name) for name in preferred_names}
+              search_n = normalize(search)
+              best = None
+              best_score = -1
 
-              raise RuntimeError(" | ".join(errors))
+              for item in candidates:
+                  team = item.get("team", {})
+                  name = team.get("name", "")
+                  team_country = team.get("country", "")
+                  score = 0
+                  if normalize(team_country) == normalize(country):
+                      score += 30
+                  if normalize(name) in preferred:
+                      score += 100
+                  elif search_n in normalize(name):
+                      score += 20
 
-          def format_match(event):
-              start = datetime.fromtimestamp(event["startTimestamp"], TZ)
-              home = event.get("homeTeam", {}).get("name", "?")
-              away = event.get("awayTeam", {}).get("name", "?")
-              competition = event.get("tournament", {}).get("name", "")
+                  if score > best_score:
+                      best = team
+                      best_score = score
+
+              if not best or best_score < 30:
+                  found = [
+                      f"{item.get('team', {}).get('name')} ({item.get('team', {}).get('country')})"
+                      for item in candidates[:8]
+                  ]
+                  raise RuntimeError(
+                      f"Nie udało się jednoznacznie dopasować {search}; wyniki: {found}"
+                  )
+
+              print(f"Football team: {search} -> {best['name']} (ID {best['id']})")
+              return best["id"]
+
+          def next_football_match(team_id, api_key):
+              data = api_get(
+                  FOOTBALL_BASE,
+                  "fixtures",
+                  {
+                      "team": team_id,
+                      "next": 1,
+                      "timezone": "Europe/Warsaw",
+                  },
+                  api_key,
+              )
+              fixtures = data.get("response") or []
+              return fixtures[0] if fixtures else None
+
+          def format_football_match(item):
+              fixture = item.get("fixture", {})
+              start = datetime.fromisoformat(fixture["date"]).astimezone(TZ)
+              teams = item.get("teams", {})
+              home = teams.get("home", {}).get("name", "?")
+              away = teams.get("away", {}).get("name", "?")
+              competition = item.get("league", {}).get("name", "")
               day = WEEKDAYS[start.weekday()]
               return (
-                  f"{day} {start:%d.%m}, {start:%H:%M} — "
-                  f"{home} – {away}"
+                  f"{day} {start:%d.%m}, {start:%H:%M} — {home} – {away}"
                   + (f" ({competition})" if competition else "")
               )
 
-          topic = os.environ["NTFY_TOPIC"].strip()
+          def resolve_poland_volleyball(api_key):
+              attempts = [
+                  {"search": "Poland"},
+                  {"name": "Poland"},
+              ]
+              errors = []
+
+              for params in attempts:
+                  try:
+                      data = api_get(VOLLEYBALL_BASE, "teams", params, api_key)
+                      candidates = data.get("response") or []
+                      if not candidates:
+                          continue
+
+                      best = None
+                      best_score = -1
+                      for item in candidates:
+                          team = item.get("team", item)
+                          name = team.get("name", "")
+                          country = team.get("country") or {}
+                          if isinstance(country, dict):
+                              country_name = country.get("name", "")
+                          else:
+                              country_name = str(country)
+
+                          score = 0
+                          if normalize(name) == "poland":
+                              score += 100
+                          elif "poland" in normalize(name):
+                              score += 20
+                          if normalize(country_name) == "poland":
+                              score += 30
+                          if team.get("national") is True:
+                              score += 20
+
+                          if score > best_score:
+                              best = team
+                              best_score = score
+
+                      if best and normalize(best.get("name", "")) == "poland":
+                          print(
+                              f"Volleyball team: Poland -> {best['name']} "
+                              f"(ID {best['id']})"
+                          )
+                          return best["id"]
+                  except Exception as exc:
+                      errors.append(str(exc))
+
+              raise RuntimeError(
+                  "Nie znaleziono reprezentacji Polski w API-Volleyball"
+                  + (f" | {' | '.join(errors)}" if errors else "")
+              )
+
+          def next_volleyball_match(team_id, api_key):
+              now_ts = int(datetime.now(TZ).timestamp())
+              year = datetime.now(TZ).year
+              future_games = []
+              errors = []
+
+              for season in (year, year + 1):
+                  try:
+                      data = api_get(
+                          VOLLEYBALL_BASE,
+                          "games",
+                          {
+                              "team": team_id,
+                              "season": season,
+                              "timezone": "Europe/Warsaw",
+                          },
+                          api_key,
+                      )
+                      for game in data.get("response") or []:
+                          ts = int(game.get("timestamp") or 0)
+                          if ts >= now_ts:
+                              future_games.append(game)
+                  except Exception as exc:
+                      errors.append(f"sezon {season}: {exc}")
+
+              if future_games:
+                  return min(future_games, key=lambda game: int(game.get("timestamp") or 0))
+
+              if errors:
+                  raise RuntimeError(" | ".join(errors))
+              return None
+
+          def format_volleyball_match(game):
+              if game.get("timestamp"):
+                  start = datetime.fromtimestamp(int(game["timestamp"]), TZ)
+              else:
+                  start = datetime.fromisoformat(game["date"]).astimezone(TZ)
+              teams = game.get("teams", {})
+              home = teams.get("home", {}).get("name", "?")
+              away = teams.get("away", {}).get("name", "?")
+              competition = game.get("league", {}).get("name", "")
+              day = WEEKDAYS[start.weekday()]
+              return (
+                  f"{day} {start:%d.%m}, {start:%H:%M} — {home} – {away}"
+                  + (f" ({competition})" if competition else "")
+              )
+
+          topic = os.environ.get("NTFY_TOPIC", "").strip()
+          api_key = os.environ.get("APISPORTS_KEY", "").strip()
           location = os.environ.get("WEATHER_LOCATION", "Pabianice").strip()
+
           if not topic:
               raise RuntimeError("Secret NTFY_TOPIC jest pusty")
+          if not api_key:
+              raise RuntimeError("Secret APISPORTS_KEY jest pusty lub nie istnieje")
 
           sections = []
 
@@ -203,19 +366,42 @@ jobs:
               sections.append(f"🌤 Pogoda — {location}: nie udało się pobrać danych")
 
           match_lines = ["🏟 Najbliższe mecze:"]
-          for label, team_id in TEAMS:
+
+          try:
+              poland_id = resolve_poland_volleyball(api_key)
+              game = next_volleyball_match(poland_id, api_key)
+              if game:
+                  match_lines.append(
+                      f"• 🇵🇱 Polska (siatkówka M): {format_volleyball_match(game)}"
+                  )
+              else:
+                  match_lines.append(
+                      "• 🇵🇱 Polska (siatkówka M): brak zaplanowanego meczu w API"
+                  )
+          except Exception as exc:
+              print(f"Błąd terminarza siatkówki: {exc}")
+              match_lines.append(
+                  "• 🇵🇱 Polska (siatkówka M): nie udało się pobrać terminarza"
+              )
+
+          for label, search, country, preferred_names in FOOTBALL_TEAMS:
               try:
-                  event = next_match(team_id)
-                  if event:
-                      match_lines.append(f"• {label}: {format_match(event)}")
+                  team_id = resolve_football_team(
+                      search, country, preferred_names, api_key
+                  )
+                  fixture = next_football_match(team_id, api_key)
+                  if fixture:
+                      match_lines.append(
+                          f"• {label}: {format_football_match(fixture)}"
+                      )
                   else:
-                      match_lines.append(f"• {label}: brak zaplanowanego meczu")
+                      match_lines.append(f"• {label}: brak zaplanowanego meczu w API")
               except Exception as exc:
                   print(f"Błąd terminarza dla {label}: {exc}")
                   match_lines.append(f"• {label}: nie udało się pobrać terminarza")
 
           sections.append("\n".join(match_lines))
-          sections.append("Źródła danych: Open-Meteo • SofaScore")
+          sections.append("Źródła danych: Open-Meteo • API-Sports")
           message = "\n\n".join(sections)
 
           ntfy_req = urllib.request.Request(
@@ -223,7 +409,7 @@ jobs:
               data=message.encode("utf-8"),
               headers={
                   "Title": "Poranny raport",
-                  "Tags": "partly_sunny,soccer",
+                  "Tags": "partly_sunny,soccer,volleyball",
                   "Content-Type": "text/plain; charset=utf-8",
               },
               method="POST",
